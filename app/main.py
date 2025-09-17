@@ -1,5 +1,6 @@
 # app/main.py
 import os
+import re, uuid, pathlib, time
 
 # --- CPU only / env flags (não inicializa CUDA/TF) ---
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -8,7 +9,6 @@ os.environ.setdefault("INSIGHTFACE_HOME", "/workspace/.insightface")
 os.environ.setdefault("FORCE_OPENCV_DETECTOR", "1")  # força OpenCV por padrão
 os.environ.setdefault("RETURN_200_ON_ERRORS", "1")   # evita 500 em register/verify por padrão
 
-import time
 import logging
 import traceback
 from contextvars import ContextVar
@@ -22,7 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .schemas import (
     LivenessResponse, LivenessQuery, FaceResult, BBox,
-    RegisterResponse, VerifyResponse
+    RegisterResponse, VerifyResponse,
+    DatasetUploadResponse, DatasetStatsResponse
 )
 from .utils import read_image_from_upload, read_image_from_base64
 from .liveness import check_liveness, DEFAULT_DETECTOR, DEFAULT_THRESHOLD
@@ -324,3 +325,127 @@ async def v1_verify(
                                   match_threshold=float(match_threshold_q or match_threshold_f or 0.35),
                                   message=f"Falha interna na verificação: {e}")
         raise HTTPException(status_code=500, detail=f"Erro na verificação: {e}")
+
+# ---------- Dataset: upload e stats ----------
+def _dataset_base() -> str:
+    # raiz do dataset (env configurável)
+    return os.getenv("TRAIN_DIR", "/workspace/data/train")
+
+def _ensure_dir(p: str) -> str:
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", (s or "anon"))[:60] or "anon"
+
+def _ext_from_filename(name: str) -> str:
+    ext = (os.path.splitext(name or "")[1] or "").lower()
+    return ext if ext in [".jpg", ".jpeg", ".png"] else ".jpg"
+
+def _imwrite(path: str, bgr: np.ndarray) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    flag = ".png" if ext == ".png" else ".jpg"
+    params = [int(cv2.IMWRITE_JPEG_QUALITY), 92] if flag == ".jpg" else []
+    ok, buf = cv2.imencode(flag, bgr, params)
+    if not ok:
+        raise RuntimeError("Falha ao codificar imagem")
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
+
+@app.post("/v1/dataset/upload", response_model=DatasetUploadResponse)
+async def dataset_upload(
+    image: UploadFile = File(...),
+    label: str = Query(..., description="live ou spoof"),
+    user_id: Optional[str] = Query(None, description="opcional, referência"),
+    # aceita parâmetros de liveness iguais aos outros endpoints
+    detector_backend_q: Optional[str] = Query(None),
+    threshold_q: Optional[float] = Query(None),
+    detector_backend_f: Optional[str] = Form(None),
+    threshold_f: Optional[float] = Form(None),
+):
+    """
+    Salva a imagem em data/train/<label>/{raw,faces}, roda a detecção/liveness
+    para validar e também salvar o crop da face.
+    """
+    label = (label or "").strip().lower()
+    if label not in ("live", "spoof"):
+        raise HTTPException(status_code=400, detail="label deve ser 'live' ou 'spoof'")
+
+    try:
+        bgr = read_image_from_upload(image.file)
+        # usa a mesma resolução de parâmetros do /v1/liveness
+        detector_backend, threshold = _resolve_params(
+            detector_backend_q, threshold_q, detector_backend_f, threshold_f, body=None
+        )
+        results, _lat = check_liveness(bgr_image=bgr, detector_backend=detector_backend, threshold=threshold)
+        if not results:
+            raise HTTPException(status_code=422, detail="Nenhum rosto detectado")
+
+        # pega a maior face
+        primary = max(results, key=lambda r: r["bbox"]["w"] * r["bbox"]["h"])
+        bbox = primary["bbox"]
+
+        # paths
+        base = _dataset_base()
+        raw_dir   = _ensure_dir(os.path.join(base, label, "raw"))
+        faces_dir = _ensure_dir(os.path.join(base, label, "faces"))
+
+        ts  = int(time.time())
+        uid = _safe_name(user_id or "anon")
+        rnd = uuid.uuid4().hex[:8]
+        ext = _ext_from_filename(image.filename)
+
+        raw_path  = os.path.join(raw_dir,   f"{ts}_{uid}_{rnd}{ext}")
+        face_path = os.path.join(faces_dir, f"{ts}_{uid}_{rnd}{ext}")
+
+        # salva RAW
+        _imwrite(raw_path, bgr)
+
+        # recorta face com margem e salva
+        crop = _crop_by_bbox(bgr, bbox, margin=0.2)
+        _imwrite(face_path, crop)
+
+        face_resp = FaceResult(
+            is_live=primary["is_live"],
+            score=float(primary["score"]),
+            threshold=float(primary["threshold"]),
+            bbox=BBox(**bbox),
+            extra={**(primary.get("extra") or {}), "detector_used": detector_backend},
+        )
+
+        return DatasetUploadResponse(
+            success=True,
+            label=label,
+            paths={
+                "raw": str(pathlib.Path(raw_path).resolve()),
+                "face": str(pathlib.Path(face_path).resolve()),
+            },
+            face=face_resp,
+            message="Imagem adicionada ao dataset"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(f"[dataset-upload] error: {e}")
+        raise HTTPException(status_code=500, detail=f"Falha no upload do dataset: {e}")
+
+@app.get("/v1/dataset/stats", response_model=DatasetStatsResponse)
+def dataset_stats():
+    base = pathlib.Path(_dataset_base())
+    live_glob  = list((base / "live").rglob("*.[jp][pn]g"))
+    spoof_glob = list((base / "spoof").rglob("*.[jp][pn]g"))
+
+    n_live  = len(live_glob)
+    n_spoof = len(spoof_glob)
+    total   = n_live + n_spoof
+
+    live_samples  = [str(p.resolve()) for p in sorted(live_glob)[-5:]]
+    spoof_samples = [str(p.resolve()) for p in sorted(spoof_glob)[-5:]]
+
+    return DatasetStatsResponse(
+        total=total,
+        live=n_live,
+        spoof=n_spoof,
+        samples={"live": live_samples, "spoof": spoof_samples},
+    )

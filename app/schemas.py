@@ -1,6 +1,6 @@
 # app/schemas.py
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import Literal, List, Dict, Optional
 
 # ---------- Liveness ----------
 class BBox(BaseModel):
@@ -41,3 +41,16 @@ class VerifyResponse(BaseModel):
     cosine_distance: float
     match_threshold: float
     message: Optional[str] = None
+
+class DatasetUploadResponse(BaseModel):
+    success: bool
+    label: Literal["live", "spoof"]
+    paths: Dict[str, str]  # {"raw": "...", "face": "..."}
+    face: Optional[FaceResult] = None
+    message: Optional[str] = None
+
+class DatasetStatsResponse(BaseModel):
+    total: int
+    live: int
+    spoof: int
+    samples: Dict[str, List[str]]  # {"live": [...], "spoof": [...]}

@@ -143,6 +143,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8081 --loop asyncio --http h11 --log-
       datasetStats: "/v1/dataset/stats"
     };
 
+    const VIDEO_DURATION_MS = 2500;
+
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
     const context = canvas.getContext('2d');
@@ -209,7 +211,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8081 --loop asyncio --http h11 --log-
       else if (devY > 0.2) { instruction = cy < vh/2 ? "⬆️ <strong>Mova para baixo</strong>" : "⬇️ <strong>Mova para cima</strong>"; status="Ajustando altura..."; }
       else if (sizeRatio < 0.15) { instruction="🔍 <strong>Chegue mais perto</strong>"; status="Rosto pequeno"; }
       else if (sizeRatio > 0.4) { instruction="🔎 <strong>Afaste-se</strong>"; status="Rosto grande"; }
-      else { instruction="✅ <strong>Perfeito! Pode capturar</strong>"; status="OK"; }
+      else { instruction="✅ <strong>Perfeito! Mantenha por 2s e capture</strong>"; status="OK"; }
 
       dynamicInstructions.innerHTML = instruction;
       faceStatus.textContent = status;
@@ -233,11 +235,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8081 --loop asyncio --http h11 --log-
       return { detector, thr, matchThr };
     }
 
-    async function sendToApi(action, blob, userId) {
+    async function sendToApi(action, media, userId) {
       const { detector, thr, matchThr } = readControls();
 
       const form = new FormData();
-      form.append("image", blob, "frame.jpg");
+      if (media && media.video) {
+        const videoName = media.videoName || `clip_${Date.now()}.webm`;
+        form.append("video", media.video, videoName);
+      } else if (media && media.image) {
+        const imageName = media.imageName || `frame_${Date.now()}.jpg`;
+        form.append("image", media.image, imageName);
+      } else {
+        throw new Error("Nenhum dado de mídia disponível.");
+      }
       form.append("detector_backend", detector);
       form.append("threshold", String(thr));
       if (action === "verify") form.append("match_threshold", String(matchThr));
@@ -271,6 +281,81 @@ uvicorn app.main:app --host 0.0.0.0 --port 8081 --loop asyncio --http h11 --log-
     }
     function safeJson(s){ try { return JSON.parse(s); } catch { return null; } }
 
+    async function recordVideo(durationMs = VIDEO_DURATION_MS) {
+      if (!video.srcObject) throw new Error("Câmera não ativa.");
+      if (typeof MediaRecorder === "undefined") {
+        throw new Error("MediaRecorder não suportado neste navegador.");
+      }
+
+      const candidates = [
+        "video/webm;codecs=vp9",
+        "video/webm;codecs=vp8",
+        "video/webm",
+        "video/mp4"
+      ];
+      let chosenMime = "";
+      for (const type of candidates) {
+        try {
+          if (MediaRecorder.isTypeSupported(type)) {
+            chosenMime = type;
+            break;
+          }
+        } catch (err) {
+          console.warn("MediaRecorder.isTypeSupported falhou", err);
+        }
+      }
+
+      let recorder;
+      try {
+        recorder = chosenMime ? new MediaRecorder(video.srcObject, { mimeType: chosenMime }) : new MediaRecorder(video.srcObject);
+      } catch (err) {
+        console.warn("Falha ao inicializar MediaRecorder com", chosenMime, err);
+        recorder = new MediaRecorder(video.srcObject);
+        chosenMime = recorder.mimeType || chosenMime;
+      }
+
+      const chunks = [];
+      return await new Promise((resolve, reject) => {
+        recorder.ondataavailable = evt => {
+          if (evt.data && evt.data.size > 0) chunks.push(evt.data);
+        };
+        recorder.onerror = evt => {
+          reject(evt && evt.error ? evt.error : new Error("Erro na gravação de vídeo"));
+        };
+        recorder.onstop = () => {
+          const blobType = chosenMime || recorder.mimeType || "video/webm";
+          resolve(new Blob(chunks, { type: blobType }));
+        };
+
+        try {
+          recorder.start();
+        } catch (err) {
+          reject(err);
+          return;
+        }
+
+        setTimeout(() => {
+          if (recorder.state !== "inactive") {
+            recorder.stop();
+          }
+        }, durationMs);
+      });
+    }
+
+    async function captureFrameBlob() {
+      const width = video.videoWidth || 360;
+      const height = video.videoHeight || 270;
+      canvas.width = width;
+      canvas.height = height;
+      context.drawImage(video, 0, 0, width, height);
+      return await new Promise((resolve, reject) => {
+        canvas.toBlob(blob => {
+          if (blob) resolve(blob);
+          else reject(new Error("Falha ao capturar quadro."));
+        }, "image/jpeg", 0.9);
+      });
+    }
+
     async function capture(action) {
       const userId = (document.getElementById('userId').value || "").trim();
       if ((action === "register" || action === "verify") && !userId) {
@@ -281,17 +366,38 @@ uvicorn app.main:app --host 0.0.0.0 --port 8081 --loop asyncio --http h11 --log-
       // feedback
       const origBorder = video.style.border;
       video.style.border = "3px solid #ff9800";
-      setResult("📸 Capturando imagem...");
+      setResult(`🎥 Gravando vídeo (~${(VIDEO_DURATION_MS/1000).toFixed(1)}s)...`);
 
-      await new Promise(r => setTimeout(r, 200));
-      canvas.width = video.videoWidth || 360;
-      canvas.height = video.videoHeight || 270;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.9));
+      await new Promise(r => setTimeout(r, 150));
+
+      const mediaPayload = {};
+      try {
+        const clip = await recordVideo(VIDEO_DURATION_MS);
+        if (clip && clip.size > 0) {
+          const extension = clip.type && clip.type.includes("mp4") ? "mp4" : "webm";
+          mediaPayload.video = clip;
+          mediaPayload.videoName = `clip_${Date.now()}.${extension}`;
+        }
+      } catch (err) {
+        console.warn("Gravação de vídeo falhou, fallback para foto.", err);
+        setResult("⚠️ Falha na gravação de vídeo, usando foto única.");
+      }
+
+      if (!mediaPayload.video) {
+        try {
+          const frame = await captureFrameBlob();
+          mediaPayload.image = frame;
+          mediaPayload.imageName = `frame_${Date.now()}.jpg`;
+        } catch (err) {
+          setResult("❌ Erro ao capturar imagem: " + err.message);
+          video.style.border = origBorder || "3px solid #000";
+          return;
+        }
+      }
 
       setResult("🔄 Enviando para o servidor...");
       try {
-        const data = await sendToApi(action, blob, userId);
+        const data = await sendToApi(action, mediaPayload, userId);
         const lines = [];
         if (action === "register") {
           lines.push(`🧑 Usuário: ${userId}`);

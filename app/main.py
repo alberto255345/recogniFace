@@ -6,7 +6,7 @@ import re, uuid, pathlib, time
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("INSIGHTFACE_HOME", "/workspace/.insightface")
-os.environ.setdefault("FORCE_OPENCV_DETECTOR", "1")  # força OpenCV por padrão
+os.environ.setdefault("FORCE_OPENCV_DETECTOR", "0")  # permite Yunet/Haar quando configurado
 os.environ.setdefault("RETURN_200_ON_ERRORS", "1")   # evita 500 em register/verify por padrão
 
 import logging
@@ -108,6 +108,20 @@ def _crop_by_bbox(bgr: np.ndarray, bbox: Dict[str, int], margin: float = 0.2) ->
         return bgr
     return bgr[y1:y2, x1:x2].copy()
 
+
+def _prepare_face_extra(extra: Optional[Dict], requested_detector: Optional[str]) -> Dict:
+    data: Dict = dict(extra or {})
+    requested_norm = (requested_detector or DEFAULT_DETECTOR).lower()
+    used = data.get("detector_used") or data.get("detector_backend")
+    if not used:
+        used = requested_norm
+    if used:
+        data.setdefault("detector_backend", used)
+        data.setdefault("detector_used", used)
+    if requested_norm:
+        data.setdefault("detector_requested", requested_norm)
+    return data
+
 def _resolve_params(
     detector_backend_q: Optional[str],
     threshold_q: Optional[float],
@@ -146,6 +160,7 @@ def _aggregate_video_entries(
             "score": float(entry["face"].get("score", 0.0)),
             "threshold": float(entry["face"].get("threshold", 0.0)),
             "is_live": bool(entry["face"].get("is_live", False)),
+            "detector_used": (entry["face"].get("extra") or {}).get("detector_backend"),
         }
         for entry in entries
     ]
@@ -165,6 +180,10 @@ def _aggregate_video_entries(
         "requested_detector": detector_backend,
         "per_frame": per_frame,
     }
+    if effective_backend:
+        extra.setdefault("detector_backend", effective_backend)
+        extra.setdefault("detector_used", effective_backend)
+    extra.setdefault("detector_requested", detector_backend)
     if frames_with_face < VIDEO_LIVENESS_MIN_FRAMES:
         extra["decision_reason"] = "frames_with_face_below_min"
     elif live_ratio < VIDEO_LIVENESS_PASS_RATIO:
@@ -333,7 +352,7 @@ async def v1_liveness(
                 score=r["score"],
                 threshold=r["threshold"],
                 bbox=BBox(**r["bbox"]),
-                extra={**(r.get("extra") or {}), "detector_used": detector_backend},
+                extra=_prepare_face_extra(r.get("extra"), detector_backend),
             )
             for r in results
         ]
@@ -643,7 +662,7 @@ async def dataset_upload(
             score=float(primary["score"]),
             threshold=float(primary["threshold"]),
             bbox=BBox(**bbox),
-            extra={**(primary.get("extra") or {}), "detector_used": detector_backend},
+            extra=_prepare_face_extra(primary.get("extra"), detector_backend),
         )
 
         return DatasetUploadResponse(

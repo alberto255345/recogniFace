@@ -1,94 +1,93 @@
 # app/recognition.py
+from __future__ import annotations
 import os
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, List
 import numpy as np
 from numpy.linalg import norm
 import cv2
+from insightface.app import FaceAnalysis
 
-# >>> usamos DeepFace (Facenet512) para embeddings - CPU <<<
-from deepface import DeepFace
+_APP: Optional[FaceAnalysis] = None
 
-# Stub para compatibilidade com main.py (não faz nada, só existe)
-def init_recognition(providers=None, det_size: Tuple[int, int] = (640, 640)):
-    return None
-
-def _ensure_min_side(img: np.ndarray, min_side: int = 480) -> np.ndarray:
-    h, w = img.shape[:2]
-    s = min(h, w)
-    if s >= min_side:
-        return img
-    scale = float(min_side) / max(1, s)
-    new_w, new_h = int(w * scale), int(h * scale)
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-def _crop_by_bbox(bgr: np.ndarray, bbox: Dict[str, int], margin: float = 0.35) -> np.ndarray:
-    H, W = bgr.shape[:2]
-    x = int(bbox.get("x", 0)); y = int(bbox.get("y", 0))
-    w = int(bbox.get("w", 0)); h = int(bbox.get("h", 0))
-    cx, cy = x + w / 2.0, y + h / 2.0
-    s = int(max(w, h) * (1.0 + margin))
-    x1 = max(0, int(cx - s / 2)); y1 = max(0, int(cy - s / 2))
-    x2 = min(W, int(cx + s / 2)); y2 = min(H, int(cy + s / 2))
-    if x2 <= x1 or y2 <= y1:
-        return bgr
-    return bgr[y1:y2, x1:x2].copy()
-
-def _represent_bgr(bgr: np.ndarray) -> np.ndarray:
+def init_recognition(
+    providers: Optional[List[str]] = None,
+    det_size: Tuple[int, int] = (960, 960),
+) -> FaceAnalysis:
     """
-    Extrai embedding com DeepFace (Facenet512).
-    - detector_backend='skip' porque já recebemos a face recortada.
-    - enforce_detection=False para não levantar exceção.
+    Inicializa (uma única vez) o InsightFace (buffalo_l) via ONNXRuntime.
+    Por padrão roda em CPU (providers=['CPUExecutionProvider']).
     """
-    # DeepFace aceita np.ndarray em BGR; mantemos sem converter para RGB.
-    reps = DeepFace.represent(
-        img_path=bgr,
-        model_name="Facenet512",
-        detector_backend="skip",
-        enforce_detection=False,
-        align=False,
-        normalization="base",
-    )
-    if not reps:
-        raise ValueError("Falha ao extrair embedding (DeepFace vazio)")
-    emb = np.array(reps[0]["embedding"], dtype="float32")
-    # normaliza (cosine-friendly)
-    emb = emb / (norm(emb) + 1e-9)
-    return emb
+    global _APP
+    if _APP is not None:
+        return _APP
 
-def embed_face_from_bbox(bgr: np.ndarray, bbox: Dict[str, int], margin: float = 0.35) -> np.ndarray:
+    root = os.environ.get("INSIGHTFACE_HOME") or os.path.expanduser("~/.insightface")
+    os.makedirs(root, exist_ok=True)
+
+    if providers is None:
+        providers = ["CPUExecutionProvider"]
+
+    app = FaceAnalysis(name="buffalo_l", providers=providers, root=root)
+
+    # ctx_id: -1 para CPU, 0+ para GPU. Se houver CUDAExecutionProvider, usa 0.
+    ctx_id = 0 if any("CUDA" in p for p in providers) else -1
+    app.prepare(ctx_id=ctx_id, det_size=det_size)
+
+    _APP = app
+    return _APP
+
+def _ensure_app() -> FaceAnalysis:
+    return init_recognition() if _APP is None else _APP
+
+def _pick_largest(face_objs):
+    def area(f):
+        box = f.bbox.astype(int)
+        return int((box[2] - box[0]) * (box[3] - box[1]))
+    return max(face_objs, key=area)
+
+def embed_face(bgr: np.ndarray) -> np.ndarray:
     """
-    Tenta no crop (várias margens); se falhar, usa frame inteiro com upscale.
+    Recebe um recorte BGR contendo uma face e retorna embedding L2-normalizado (float32).
     """
-    for m in (margin, 0.6, 1.0):
-        try:
-            crop = _crop_by_bbox(bgr, bbox, margin=m)
-            crop = _ensure_min_side(crop, 560)
-            return _represent_bgr(crop)
-        except Exception:
-            continue
-    full = _ensure_min_side(bgr, 720)
-    return _represent_bgr(full)
+    app = _ensure_app()
+    if bgr is None or bgr.size == 0:
+        raise ValueError("Imagem vazia para embedding")
 
-# Mantém nomes que o main importa (backwards compatible)
-def embed_face(img_bgr: np.ndarray) -> np.ndarray:
-    img = _ensure_min_side(img_bgr, 560)
-    return _represent_bgr(img)
+    if bgr.dtype != np.uint8:
+        bgr = np.clip(bgr, 0, 255).astype("uint8")
 
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (norm(a) * norm(b) + 1e-9))
+    faces = app.get(bgr)
+    if not faces:
+        raise ValueError("Nenhum rosto detectado para embedding")
 
-def cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
-    return 1.0 - cosine_sim(a, b)
+    face = _pick_largest(faces)
+    emb = getattr(face, "normed_embedding", None)
+    if emb is None:
+        emb = face.embedding
+        emb = emb / (norm(emb) + 1e-9)
 
-def save_embedding(user_id: str, emb: np.ndarray, base_dir: str = "data/embeddings") -> str:
+    return emb.astype("float32")
+
+def save_embedding(user_id: str, embedding: np.ndarray, base_dir: str = "data/embeddings") -> str:
     os.makedirs(base_dir, exist_ok=True)
     path = os.path.join(base_dir, f"{user_id}.npz")
-    np.savez_compressed(path, embedding=emb)
+    np.savez_compressed(path, embedding=embedding.astype("float32"))
     return path
 
 def load_embedding(user_id: str, base_dir: str = "data/embeddings") -> np.ndarray:
     path = os.path.join(base_dir, f"{user_id}.npz")
     if not os.path.exists(path):
-        raise FileNotFoundError("Usuário não cadastrado")
+        raise FileNotFoundError(path)
     data = np.load(path)
-    return data["embedding"].astype("float32")
+    emb = data["embedding"].astype("float32")
+    emb = emb / (norm(emb) + 1e-9)
+    return emb
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.astype("float32"); b = b.astype("float32")
+    a = a / (norm(a) + 1e-9)
+    b = b / (norm(b) + 1e-9)
+    return float(np.dot(a, b))
+
+def cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
+    return 1.0 - cosine_sim(a, b)

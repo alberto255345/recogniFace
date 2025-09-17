@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Biometria Facial</title>
+  <link href="https://fonts.googleapis.com/css?family=Roboto+Condensed" rel="stylesheet">
+  <style>
+    body { margin:0; padding:0; background:#fff; font-family:'Roboto Condensed',sans-serif; font-size:14px; text-align:center;}
+    h1 { margin:20px 0; font-size:24px;}
+    video { border:3px solid #000; border-radius:6px; margin:15px auto; display:block;}
+    input[type="text"], select, input[type="number"]{
+      padding:10px; margin:6px; border:1px solid #000; border-radius:4px; font-size:14px; width:240px;
+    }
+    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:center; margin:8px 0;}
+    .button_base{ margin:8px; font-size:16px; padding:10px 14px; min-width:180px; text-align:center; border:1px solid #000; cursor:pointer; transition:all .2s ease; background:#fff; color:#000; border-radius:6px;}
+    .button_base:hover{ background:#000; color:#fff;}
+    .btn-green { background:#28a745; color:#fff; border-color:#1d7f35; }
+    .btn-green:hover{ background:#1d7f35; }
+    .btn-blue { background:#1976d2; color:#fff; border-color:#145aa3; }
+    .btn-blue:hover{ background:#145aa3; }
+    .btn-red { background:#e53935; color:#fff; border-color:#b71c1c; }
+    .btn-red:hover{ background:#b71c1c; }
+    #result{ background:#f5f5f5; border:1px solid #ddd; border-radius:4px; padding:15px; margin:20px auto; white-space:pre-wrap; font-family:monospace; width:90%; max-width:1000px; text-align:left;}
+    #overlay { position:absolute; border:2px solid #4caf50; border-radius:6px; pointer-events:none; display:none;}
+    #stage { position:relative; display:inline-block;}
+    .card { border:1px solid #ddd; border-radius:8px; padding:12px; margin:14px auto; max-width:1000px; text-align:left;}
+    .card h2 { margin:6px 0 10px 0; font-size:18px; }
+    small.muted { color:#666; }
+    details { background:#fafafa; border:1px solid #eee; border-radius:8px; padding:10px 12px; margin:12px auto; max-width:1000px; text-align:left;}
+    code, pre { background:#f1f1f1; border-radius:6px; padding:4px 6px; }
+    pre { overflow:auto; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eee; margin-left:6px; font-size:12px;}
+  </style>
+</head>
+<body>
+  <h1>🔐 Sistema de Biometria Facial</h1>
+
+  <!-- CONTROLES GERAIS -->
+  <div class="card">
+    <h2>⚙️ Configurações</h2>
+    <div class="row">
+      <label>Detector:
+        <select id="detector">
+          <option value="opencv" selected>opencv</option>
+          <option value="retinaface">retinaface</option>
+        </select>
+      </label>
+      <label>Threshold (liveness):
+        <input type="number" id="thr" value="0.50" min="0" max="1" step="0.01">
+      </label>
+      <label>Match Threshold (verify):
+        <input type="number" id="matchThr" value="0.35" min="0" max="1" step="0.01">
+      </label>
+    </div>
+    <small class="muted">Dica: opencv é mais estável em CPU. Você pode ajustar os thresholds por aqui sem mexer no backend.</small>
+  </div>
+
+  <!-- INSTRUÇÕES DINÂMICAS -->
+  <div id="instructions" class="card" style="border-color:#2196f3;">
+    <h2 style="color:#1976d2;">📋 Instruções Dinâmicas</h2>
+    <div id="dynamic-instructions" style="font-size:16px;font-weight:bold;color:#1976d2;min-height:30px;">
+      🎯 Posicione seu rosto na câmera...
+    </div>
+    <div id="face-status" class="muted">Aguardando detecção...</div>
+  </div>
+
+  <!-- CÂMERA -->
+  <div id="stage">
+    <video id="video" width="360" height="270" autoplay muted aria-label="Câmera"></video>
+    <div id="overlay"></div>
+  </div>
+  <canvas id="canvas" width="360" height="270" style="display:none;"></canvas>
+
+  <!-- ID + AÇÕES -->
+  <div class="card">
+    <h2>🪪 Identificação & Ações</h2>
+    <div class="row">
+      <input type="text" id="userId" placeholder="ID do usuário (ex.: 15)" aria-describedby="userId-help" />
+      <button class="button_base btn-blue" onclick="capture('register')" aria-label="Cadastrar biometria facial">Cadastrar</button>
+      <button class="button_base" onclick="capture('verify')" aria-label="Validar biometria facial">Validar</button>
+      <button class="button_base btn-green" onclick="initCamera()" aria-label="Reiniciar câmera">🔄 Reiniciar Câmera</button>
+    </div>
+    <small id="userId-help" class="muted">Use um identificador único para cada usuário.</small>
+  </div>
+
+  <!-- MODO DATASET (TREINO) -->
+  <div class="card">
+    <h2>🧪 Modo Dataset (Coleta para Treino) <span class="pill">/v1/dataset/upload</span></h2>
+    <div class="row">
+      <label><input type="radio" name="label" value="live" checked> live (real)</label>
+      <label><input type="radio" name="label" value="spoof"> spoof (ataque)</label>
+      <button class="button_base btn-red" onclick="datasetCapture()">📸 Enviar amostra ao dataset</button>
+      <button class="button_base" onclick="datasetStats()">📊 Estatísticas do dataset</button>
+    </div>
+    <small class="muted">A amostra é validada pelo mesmo pipeline (detector/threshold) e salva em <code>$TRAIN_DIR/&lt;label&gt;/{raw,faces}</code>.</small>
+  </div>
+
+  <!-- RESULTADOS -->
+  <pre id="result"></pre>
+
+  <!-- COMO TREINAR -->
+  <details open>
+    <summary><strong>📚 Como treinar o classificador de liveness</strong></summary>
+    <ol>
+      <li>Defina o diretório base do dataset no servidor:
+        <pre><code>export TRAIN_DIR=/workspace/recogniFace/data/train
+mkdir -p "$TRAIN_DIR/live/raw"  "$TRAIN_DIR/live/faces"
+mkdir -p "$TRAIN_DIR/spoof/raw" "$TRAIN_DIR/spoof/faces"</code></pre>
+      </li>
+      <li>Use o bloco “🧪 Modo Dataset” acima para enviar várias amostras:
+        <ul>
+          <li><strong>live</strong>: fotos reais, de pessoas e ambientes reais</li>
+          <li><strong.spoof</strong>: fotos de tela, impressões, celular exibindo rosto, etc.</li>
+        </ul>
+      </li>
+      <li>Quando tiver quantidade suficiente (ex.: 100+ de cada classe), treine no servidor:
+        <pre><code># exemplo (ajuste o caminho se necessário)
+python -m scripts.train_liveness \
+  --train_dir "$TRAIN_DIR" \
+  --out /workspace/models/liveness_lr.joblib</code></pre>
+      </li>
+      <li>Informe o classificador para a API e reinicie:
+        <pre><code>export LIVENESS_CLF_PATH=/workspace/models/liveness_lr.joblib
+# (opcional) ajustar pesos/limites das heurísticas:
+export LIVENESS_THR_CAP=0.55
+export LIVENESS_W_AXIS=0.08 LIVENESS_W_GLARE=0.06 LIVENESS_W_LINES=0.06 LIVENESS_W_SHARP_SMALL=0.05
+uvicorn app.main:app --host 0.0.0.0 --port 8081 --loop asyncio --http h11 --log-level info</code></pre>
+      </li>
+      <li>Valide novamente com casos reais e de spoof para calibrar o threshold.</li>
+    </ol>
+    <p class="muted">Se quiser, posso te mandar o script <code>scripts/train_liveness</code> prontinho (LR/SVC) usando as features do pipeline.</p>
+  </details>
+
+  <script>
+    // ===== CONFIG =====
+    const API_BASE = "https://signed-conferencing-descending-survivors.trycloudflare.com";
+    const ROUTES = {
+      liveness: "/v1/liveness",
+      register: "/v1/register",
+      verify: "/v1/verify",
+      datasetUpload: "/v1/dataset/upload",
+      datasetStats: "/v1/dataset/stats"
+    };
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const context = canvas.getContext('2d');
+    const dynamicInstructions = document.getElementById('dynamic-instructions');
+    const faceStatus = document.getElementById('face-status');
+    const overlay = document.getElementById('overlay');
+    const stage = document.getElementById('stage');
+
+    let detectionInterval = null;
+
+    // ===== Câmera =====
+    function initCamera() {
+      stopCamera();
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false })
+        .then(stream => {
+          video.srcObject = stream;
+          video.onloadedmetadata = () => {
+            video.play();
+            startFaceGuidance();
+          };
+        })
+        .catch(err => setResult("Erro ao acessar câmera: " + err.message));
+    }
+    function stopCamera() {
+      if (video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+        video.srcObject = null;
+      }
+      stopFaceGuidance();
+    }
+
+    // ===== Guia (heurística simples para UX) =====
+    function startFaceGuidance() {
+      stopFaceGuidance();
+      detectionInterval = setInterval(() => {
+        const guide = simpleCenterHeuristic();
+        updateDynamicInstructions(guide);
+      }, 400);
+    }
+    function stopFaceGuidance() { if (detectionInterval) clearInterval(detectionInterval); detectionInterval = null; }
+    function simpleCenterHeuristic() {
+      if (!video.videoWidth || !video.videoHeight) return null;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const centerX = vw/2, centerY = vh/2;
+      const size = Math.min(vw, vh) * 0.3;
+      return { detected: true, centerX, centerY, size, confidence: 0.5 };
+    }
+    function updateDynamicInstructions(faceData) {
+      if (!faceData || !faceData.detected) {
+        dynamicInstructions.innerHTML = "🎯 <strong>Posicione seu rosto na câmera</strong>";
+        faceStatus.textContent = "Nenhum rosto detectado";
+        overlay.style.display = "none";
+        return;
+      }
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const cx = faceData.centerX ?? vw/2, cy = faceData.centerY ?? vh/2;
+      const size = faceData.size ?? 100;
+      const devX = Math.abs(cx - vw/2)/(vw/2);
+      const devY = Math.abs(cy - vh/2)/(vh/2);
+      const sizeRatio = size/Math.min(vw, vh);
+
+      let instruction = "", status = "";
+      if (devX > 0.2) { instruction = cx < vw/2 ? "⬅️ <strong>Mova para a direita</strong>" : "➡️ <strong>Mova para a esquerda</strong>"; status="Centralizando..."; }
+      else if (devY > 0.2) { instruction = cy < vh/2 ? "⬆️ <strong>Mova para baixo</strong>" : "⬇️ <strong>Mova para cima</strong>"; status="Ajustando altura..."; }
+      else if (sizeRatio < 0.15) { instruction="🔍 <strong>Chegue mais perto</strong>"; status="Rosto pequeno"; }
+      else if (sizeRatio > 0.4) { instruction="🔎 <strong>Afaste-se</strong>"; status="Rosto grande"; }
+      else { instruction="✅ <strong>Perfeito! Pode capturar</strong>"; status="OK"; }
+
+      dynamicInstructions.innerHTML = instruction;
+      faceStatus.textContent = status;
+
+      const rect = video.getBoundingClientRect();
+      const boxSizePx = Math.min(rect.width, rect.height) * sizeRatio;
+      overlay.style.width = boxSizePx + "px";
+      overlay.style.height = boxSizePx + "px";
+      overlay.style.left = (rect.left + (rect.width - boxSizePx)/2 - stage.getBoundingClientRect().left) + "px";
+      overlay.style.top  = (rect.top  + (rect.height - boxSizePx)/2 - stage.getBoundingClientRect().top) + "px";
+      overlay.style.display = "block";
+    }
+
+    // ===== Helpers =====
+    function setResult(txt){ document.getElementById('result').textContent = txt; }
+
+    function readControls() {
+      const detector = document.getElementById('detector').value || "opencv";
+      const thr = parseFloat(document.getElementById('thr').value || "0.5");
+      const matchThr = parseFloat(document.getElementById('matchThr').value || "0.35");
+      return { detector, thr, matchThr };
+    }
+
+    async function sendToApi(action, blob, userId) {
+      const { detector, thr, matchThr } = readControls();
+
+      const form = new FormData();
+      form.append("image", blob, "frame.jpg");
+      form.append("detector_backend", detector);
+      form.append("threshold", String(thr));
+      if (action === "verify") form.append("match_threshold", String(matchThr));
+
+      const path = ROUTES[action] || ROUTES.liveness;
+      const query = (action === "register" || action === "verify") ? `?user_id=${encodeURIComponent(userId)}` : "";
+      const url = `${API_BASE}${path}${query}`;
+
+      try {
+        return await fetchJson(url, form);
+      } catch (e1) {
+        if (detector !== "opencv") {
+          console.warn("Falha com detector="+detector+", tentando opencv...", e1);
+          form.set("detector_backend", "opencv");
+          return await fetchJson(url, form);
+        }
+        throw e1;
+      }
+    }
+
+    async function fetchJson(url, formOrNull) {
+      const opts = formOrNull ? { method:"POST", body: formOrNull, mode:"cors" } : { method:"GET", mode:"cors" };
+      const resp = await fetch(url, opts);
+      const txt = await resp.text();
+      const maybeJson = safeJson(txt);
+      if (!resp.ok) {
+        const msg = (maybeJson && maybeJson.detail) ? maybeJson.detail : txt || `HTTP ${resp.status}`;
+        throw new Error(msg);
+      }
+      return maybeJson ?? {};
+    }
+    function safeJson(s){ try { return JSON.parse(s); } catch { return null; } }
+
+    async function capture(action) {
+      const userId = (document.getElementById('userId').value || "").trim();
+      if ((action === "register" || action === "verify") && !userId) {
+        alert("Informe o ID do usuário!"); return;
+      }
+      if (!video.srcObject) { setResult("Erro: câmera não ativa."); return; }
+
+      // feedback
+      const origBorder = video.style.border;
+      video.style.border = "3px solid #ff9800";
+      setResult("📸 Capturando imagem...");
+
+      await new Promise(r => setTimeout(r, 200));
+      canvas.width = video.videoWidth || 360;
+      canvas.height = video.videoHeight || 270;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.9));
+
+      setResult("🔄 Enviando para o servidor...");
+      try {
+        const data = await sendToApi(action, blob, userId);
+        const lines = [];
+        if (action === "register") {
+          lines.push(`🧑 Usuário: ${userId}`);
+          lines.push(`🗂️ Ação: cadastro`);
+          lines.push(`🛡️ Liveness: ${data.liveness_ok ? "OK" : "REPROVADO"}`);
+          lines.push(data.message || (data.success ? "Cadastrado com sucesso." : "Falha no cadastro."));
+        } else if (action === "verify") {
+          lines.push(`🧑 Usuário: ${userId}`);
+          lines.push(`🧪 Ação: verificação`);
+          lines.push(`🛡️ Liveness: ${data.liveness_ok ? "OK" : "REPROVADO"}`);
+          if (data.success) {
+            lines.push(`🎯 Match: ${data.match ? "SIM ✅" : "NÃO ❌"}`);
+            if (typeof data.cosine_similarity === "number") {
+              lines.push(`   cosine_similarity: ${data.cosine_similarity.toFixed(4)}`);
+            }
+            if (typeof data.cosine_distance === "number") {
+              lines.push(`   cosine_distance: ${data.cosine_distance.toFixed(4)} (thr=${data.match_threshold})`);
+            }
+            if (data.message) lines.push(data.message);
+          } else {
+            lines.push(data.message || "Falha na verificação.");
+          }
+        } else {
+          lines.push(JSON.stringify(data, null, 2));
+        }
+        setResult(lines.join("\n"));
+      } catch (err) {
+        setResult("❌ Erro: " + err.message);
+      } finally {
+        video.style.border = origBorder || "3px solid #000";
+      }
+    }
+
+    // ===== DATASET =====
+    async function datasetCapture() {
+      const label = document.querySelector('input[name="label"]:checked').value;
+      if (!video.srcObject) { setResult("Erro: câmera não ativa."); return; }
+
+      setResult(`📸 Capturando amostra (${label})...`);
+      await new Promise(r => setTimeout(r, 200));
+      canvas.width = video.videoWidth || 360;
+      canvas.height = video.videoHeight || 270;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.9));
+
+      const { detector, thr } = readControls();
+      const url = `${API_BASE}${ROUTES.datasetUpload}?label=${encodeURIComponent(label)}&detector_backend=${encodeURIComponent(detector)}&threshold=${encodeURIComponent(thr)}`;
+
+      const form = new FormData();
+      form.append("image", blob, `frame_${Date.now()}.jpg`);
+
+      setResult("🔄 Enviando amostra ao dataset...");
+      try {
+        const data = await fetchJson(url, form);
+        setResult(`✅ Dataset upload OK\n\n${JSON.stringify(data, null, 2)}`);
+      } catch (err) {
+        setResult("❌ Erro no dataset upload: " + err.message);
+      }
+    }
+
+    async function datasetStats() {
+      setResult("📊 Consultando estatísticas do dataset...");
+      try {
+        const data = await fetchJson(`${API_BASE}${ROUTES.datasetStats}`);
+        setResult(`📊 Dataset stats:\n\n${JSON.stringify(data, null, 2)}`);
+      } catch (err) {
+        setResult("❌ Erro nas estatísticas: " + err.message);
+      }
+    }
+
+    // boot
+    window.addEventListener('load', initCamera);
+    window.addEventListener('beforeunload', stopCamera);
+  </script>
+</body>
+</html>

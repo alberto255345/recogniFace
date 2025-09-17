@@ -6,7 +6,7 @@ API leve em **FastAPI** para **liveness (anti-spoofing)** e **reconhecimento fac
 
 ## ✨ Recursos
 
-* **/v1/liveness**: heurísticas + sinais anti-spoof (blur, alta-freq, anisotropia de grade, glare/reflexo, linhas retas, etc.) com **limiar dinâmico**.
+* **/v1/liveness**: heurísticas + sinais anti-spoof (blur, alta-freq, anisotropia de grade, glare/reflexo, linhas retas, etc.) com **limiar dinâmico**, agora aceitando **imagem única ou clipe curto de vídeo**.
 * **/v1/register**: liveness ➜ embedding (InsightFace) ➜ salva em `data/embeddings/{user_id}.npz`.
 * **/v1/verify**: liveness ➜ embedding ➜ compara com cadastro (cosseno), com `match_threshold`.
 * **/v1/dataset/upload**: salva imagens rotuladas (`live`/`spoof`) e crops de face para treino.
@@ -18,7 +18,7 @@ API leve em **FastAPI** para **liveness (anti-spoofing)** e **reconhecimento fac
 
 ## 🧱 Arquitetura (resumo)
 
-* **Detecção de faces**: OpenCV DNN (SSD/Caffe) com cache de modelo; fallback para HaarCascade.
+* **Detecção de faces**: suporta **YuNet (ONNX)**, **OpenCV DNN (SSD/Caffe)** quando arquivos já estão presentes e fallback para **HaarCascade**, sem download em tempo de requisição.
 * **Liveness**: combinação de sinais + limiar dinâmico (piora em ambientes ruins e **endurece** se houver indícios de spoof).
 * **Reconhecimento**: InsightFace `buffalo_l` (w600k\_r50) via ONNXRuntime (providers=CPUExecutionProvider por padrão).
 * **Dataset**: imagens salvas em `TRAIN_DIR/live|spoof/{raw,faces}`.
@@ -77,12 +77,19 @@ Variáveis de ambiente úteis:
 # Diretórios
 export INSIGHTFACE_HOME=/workspace/.insightface   # cache dos modelos do InsightFace
 export TRAIN_DIR=/workspace/data/train             # onde salvamos dataset (live/spoof)
+export OPENCV_FACE_DIR=/workspace/models/opencv_face # onde ficam YuNet/DNN (sem download em runtime)
 
 # Estabilidade/segurança de threads (evita segfaults em alguns ambientes)
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 # Desliga warmup de modelos no startup (opcional)
 export DISABLE_WARMUP=1
+
+# Detectores de face
+export OPENCV_DNN_DISABLE=0           # coloque 1 para ignorar o SSD/Caffe local e usar Haar/YuNet
+export FORCE_OPENCV_DETECTOR=0        # coloque 1 para forçar uso do backend OpenCV (ignora escolha do request)
+export YUNET_SCORE_THRESHOLD=0.6      # ajustes finos opcionais para YuNet
+export YUNET_NMS_THRESHOLD=0.3
 
 # Classificador ML opcional para spoof (se treinado)
 export LIVENESS_CLF_PATH=/workspace/models/liveness_lr.joblib
@@ -99,9 +106,23 @@ export LIVENESS_W_SHARP_SMALL=0.12
 export LIVENESS_AXIS_SUSPECT=0.35
 export LIVENESS_GLARE_SUSPECT=0.08
 export LIVENESS_LINES_SUSPECT=0.10
+
+# Liveness via vídeo (amostragem e votação)
+export VIDEO_LIVENESS_MAX_FRAMES=24
+export VIDEO_LIVENESS_MIN_FRAMES=8
+export VIDEO_LIVENESS_PASS_RATIO=0.6
 ```
 
 > **INSIGHTFACE\_HOME** evita re-download do `buffalo_l` a cada startup.
+
+### Modelos de detecção (sem download em runtime)
+
+Garanta que os arquivos necessários estejam em `OPENCV_FACE_DIR` **antes** de subir o serviço:
+
+* **YuNet (recomendado)** – copie `face_detection_yunet_2023mar.onnx` para a pasta e certifique-se de usar `opencv-contrib-python>=4.6`.
+* **OpenCV DNN (SSD/Caffe)** – coloque `deploy.prototxt` e `res10_300x300_ssd_iter_140000_fp16.caffemodel` no mesmo diretório se quiser esse backend disponível.
+
+Se nenhum modelo estiver presente, o detector cai automaticamente para **HaarCascade**. Defina `OPENCV_DNN_DISABLE=1` para pular o SSD/Caffe mesmo que os arquivos existam.
 
 ---
 
@@ -141,14 +162,18 @@ Retorna status, versão, Python e info básica de CUDA (sempre false no modo CPU
 
 ### `POST /v1/liveness`
 
-**Multipart** (`image`) ou **JSON** (`image_base64`). Parâmetros opcionais:
+**Multipart** (`video` para clipes curtos ou `image` para fotos) ou **JSON** (`image_base64`). Parâmetros opcionais:
 
-* `detector_backend` (padrão `opencv`)
+* `detector_backend` (padrão `opencv`; também aceita `yunet` ou `haar`)
 * `threshold` (padrão `0.5` — pode ser dinamicamente ajustado)
 
 ```bash
-# Multipart
-curl -s -X POST "$BASE/v1/liveness?detector_backend=opencv&threshold=0.5" \
+# Multipart (vídeo)
+curl -s -X POST "$BASE/v1/liveness?detector_backend=yunet&threshold=0.5" \
+  -F "video=@/tmp/clip.webm;type=video/webm" | jq
+
+# Multipart (fallback em foto)
+curl -s -X POST "$BASE/v1/liveness?detector_backend=haar&threshold=0.5" \
   -F "image=@$HOME/foto.png;type=image/png" | jq
 ```
 
@@ -163,7 +188,9 @@ curl -s -X POST "$BASE/v1/liveness?detector_backend=opencv&threshold=0.5" \
       "threshold": 0.50,
       "bbox": {"x":79,"y":367,"w":736,"h":736},
       "extra": {
-        "detector_backend": "opencv-dnn",
+        "detector_backend": "yunet",
+        "detector_used": "yunet",
+        "detector_requested": "yunet",
         "explain": {
           "blur": 1.0,
           "saturation": 0.23,
@@ -180,23 +207,23 @@ curl -s -X POST "$BASE/v1/liveness?detector_backend=opencv&threshold=0.5" \
 }
 ```
 
-> O **threshold mostrado é o efetivo**, após ajustes dinâmicos (ex.: sobe se detectar sinais de spoof; desce levemente em ambientes difíceis).
+> O **threshold mostrado é o efetivo**, após ajustes dinâmicos (ex.: sobe se detectar sinais de spoof; desce levemente em ambientes difíceis). Para vídeo, o retorno agrega múltiplos frames (ratio de “live” vs. “spoof”) e inclui estatísticas em `extra.per_frame`.
 
 ---
 
 ### `POST /v1/register`
 
-Executa **liveness** e, se aprovado, extrai embedding (InsightFace) e salva em `data/embeddings/{user_id}.npz`.
+Executa **liveness** (aceitando vídeo curto ou foto) e, se aprovado, extrai embedding (InsightFace) da melhor frame para salvar em `data/embeddings/{user_id}.npz`.
 
-Parâmetros (query/form):
+Parâmetros (query/form + multipart):
 
 * `user_id` (obrigatório)
-* `detector_backend` (opcional)
+* `detector_backend` (opcional; `opencv`/`yunet`/`haar`)
 * `threshold` (opcional)
 
 ```bash
-curl -i --max-time 30 \
-  -F "image=@$HOME/imagem.jpeg;type=image/jpeg" \
+curl -i --max-time 60 \
+  -F "video=@/tmp/clip.webm;type=video/webm" \
   "$BASE/v1/register?user_id=15&detector_backend=opencv&threshold=0.5"
 ```
 
@@ -210,17 +237,17 @@ curl -i --max-time 30 \
 
 ### `POST /v1/verify`
 
-Executa **liveness** ➜ embedding ➜ compara c/ cadastro de `user_id`.
+Executa **liveness** (clipe de vídeo recomendado) ➜ embedding ➜ compara c/ cadastro de `user_id`.
 
-Parâmetros (query/form):
+Parâmetros (query/form + multipart):
 
 * `user_id` (obrigatório)
-* `detector_backend`, `threshold` (opcionais)
+* `detector_backend`, `threshold` (opcionais; aceitam `opencv`/`yunet`/`haar`)
 * `match_threshold` (padrão **0.35**, distância cosseno; menor = mais estrito)
 
 ```bash
-curl -i --max-time 30 \
-  -F "image=@$HOME/foto.png;type=image/png" \
+curl -i --max-time 60 \
+  -F "video=@/tmp/clip.webm;type=video/webm" \
   "$BASE/v1/verify?user_id=15&detector_backend=opencv&threshold=0.40&match_threshold=0.35"
 ```
 
@@ -265,12 +292,12 @@ $TRAIN_DIR/
 
 ```bash
 # LIVE
-curl -s -X POST "$BASE/v1/dataset/upload?label=live&detector_backend=opencv&threshold=0.5" \
+curl -s -X POST "$BASE/v1/dataset/upload?label=live&detector_backend=yunet&threshold=0.5" \
   -F "image=@$HOME/foto_real.png;type=image/png" | jq
 
 # SPOOF
 a
-curl -s -X POST "$BASE/v1/dataset/upload?label=spoof&detector_backend=opencv&threshold=0.5" \
+curl -s -X POST "$BASE/v1/dataset/upload?label=spoof&detector_backend=haar&threshold=0.5" \
   -F "image=@$HOME/foto2.png;type=image/png" | jq
 ```
 
@@ -334,7 +361,7 @@ Formato:
 
 * **Re-download de modelos InsightFace a cada start**: defina `INSIGHTFACE_HOME` para um caminho persistente (ex.: `/workspace/.insightface`).
 * **Segmentation fault**: use `--http h11`, limite threads (`OMP_NUM_THREADS=1` etc.), e desabilite warmup (`DISABLE_WARMUP=1`). Confira também `libgl1` instalado.
-* **Nenhum rosto detectado**: use imagens maiores/centradas; aumente `LIVENESS_MIN_SIDE` (ex.: 256); tente `detector_backend=opencv` (é o padrão).
+* **Nenhum rosto detectado**: use imagens maiores/centradas; aumente `LIVENESS_MIN_SIDE` (ex.: 256); experimente `detector_backend=yunet` (necessita modelo ONNX) ou `detector_backend=opencv`.
 * **Anti-spoof aprovando spoof específico**: suba pesos de penalização (`W_AXIS/GLARE/LINES/SHARP_SMALL`) ou treine um classificador com amostras reais do caso.
 * **Verify retornando 404**: garanta que `/v1/register` foi executado para o `user_id` em questão.
 

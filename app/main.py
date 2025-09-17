@@ -6,14 +6,14 @@ import re, uuid, pathlib, time
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("INSIGHTFACE_HOME", "/workspace/.insightface")
-os.environ.setdefault("FORCE_OPENCV_DETECTOR", "1")  # força OpenCV por padrão
+os.environ.setdefault("FORCE_OPENCV_DETECTOR", "0")  # permite Yunet/Haar quando configurado
 os.environ.setdefault("RETURN_200_ON_ERRORS", "1")   # evita 500 em register/verify por padrão
 
 import logging
 import traceback
 from contextvars import ContextVar
 from secrets import token_hex
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import cv2  # noqa: F401 - garante OpenCV carregado
 import numpy as np
@@ -25,7 +25,7 @@ from .schemas import (
     RegisterResponse, VerifyResponse,
     DatasetUploadResponse, DatasetStatsResponse
 )
-from .utils import read_image_from_upload, read_image_from_base64
+from .utils import read_image_from_upload, read_image_from_base64, decode_video_to_frames
 from .liveness import check_liveness, DEFAULT_DETECTOR, DEFAULT_THRESHOLD
 from .recognition import (
     embed_face, save_embedding, load_embedding,
@@ -51,6 +51,11 @@ log = logging.getLogger("api")
 
 APP_NAME = "anti-spoofing-api"
 VERSION = os.getenv("APP_VERSION", "1.0.0")
+
+VIDEO_LIVENESS_MAX_FRAMES = max(1, int(os.getenv("VIDEO_LIVENESS_MAX_FRAMES", "24")))
+VIDEO_LIVENESS_MIN_FRAMES = max(1, int(os.getenv("VIDEO_LIVENESS_MIN_FRAMES", "8")))
+VIDEO_LIVENESS_PASS_RATIO = float(os.getenv("VIDEO_LIVENESS_PASS_RATIO", "0.6"))
+VIDEO_LIVENESS_PASS_RATIO = float(min(max(VIDEO_LIVENESS_PASS_RATIO, 0.0), 1.0))
 
 app = FastAPI(title=APP_NAME, version=VERSION)
 
@@ -103,6 +108,20 @@ def _crop_by_bbox(bgr: np.ndarray, bbox: Dict[str, int], margin: float = 0.2) ->
         return bgr
     return bgr[y1:y2, x1:x2].copy()
 
+
+def _prepare_face_extra(extra: Optional[Dict], requested_detector: Optional[str]) -> Dict:
+    data: Dict = dict(extra or {})
+    requested_norm = (requested_detector or DEFAULT_DETECTOR).lower()
+    used = data.get("detector_used") or data.get("detector_backend")
+    if not used:
+        used = requested_norm
+    if used:
+        data.setdefault("detector_backend", used)
+        data.setdefault("detector_used", used)
+    if requested_norm:
+        data.setdefault("detector_requested", requested_norm)
+    return data
+
 def _resolve_params(
     detector_backend_q: Optional[str],
     threshold_q: Optional[float],
@@ -115,6 +134,126 @@ def _resolve_params(
     if os.getenv("FORCE_OPENCV_DETECTOR", "1") == "1":
         detector = "opencv"
     return detector, float(thr)
+
+
+def _aggregate_video_entries(
+    entries: List[Dict],
+    total_frames: int,
+    detector_backend: str,
+) -> Tuple[List[Dict], Optional[np.ndarray]]:
+    if not entries:
+        return [], None
+
+    frames_with_face = len(entries)
+    live_votes = sum(1 for entry in entries if entry["face"].get("is_live"))
+    avg_score = sum(float(entry["face"].get("score", 0.0)) for entry in entries) / max(1, frames_with_face)
+    avg_threshold = sum(float(entry["face"].get("threshold", 0.0)) for entry in entries) / max(1, frames_with_face)
+
+    best_entry = max(entries, key=lambda e: _area(e["face"].get("bbox", {})))
+    live_ratio = live_votes / max(1, frames_with_face)
+    decision = (frames_with_face >= VIDEO_LIVENESS_MIN_FRAMES) and (live_ratio >= VIDEO_LIVENESS_PASS_RATIO)
+
+    effective_backend = best_entry["face"].get("extra", {}).get("detector_backend", detector_backend)
+    per_frame = [
+        {
+            "frame_index": entry["frame_index"],
+            "score": float(entry["face"].get("score", 0.0)),
+            "threshold": float(entry["face"].get("threshold", 0.0)),
+            "is_live": bool(entry["face"].get("is_live", False)),
+            "detector_used": (entry["face"].get("extra") or {}).get("detector_backend"),
+        }
+        for entry in entries
+    ]
+
+    frames_without_face = max(0, total_frames - frames_with_face)
+    extra = {
+        "mode": "video",
+        "frames_total": total_frames,
+        "frames_with_face": frames_with_face,
+        "frames_without_face": frames_without_face,
+        "live_votes": live_votes,
+        "live_ratio": live_ratio,
+        "pass_ratio_threshold": VIDEO_LIVENESS_PASS_RATIO,
+        "min_frames_required": VIDEO_LIVENESS_MIN_FRAMES,
+        "best_frame_index": best_entry["frame_index"],
+        "detector_backend_effective": effective_backend,
+        "requested_detector": detector_backend,
+        "per_frame": per_frame,
+    }
+    if effective_backend:
+        extra.setdefault("detector_backend", effective_backend)
+        extra.setdefault("detector_used", effective_backend)
+    extra.setdefault("detector_requested", detector_backend)
+    if frames_with_face < VIDEO_LIVENESS_MIN_FRAMES:
+        extra["decision_reason"] = "frames_with_face_below_min"
+    elif live_ratio < VIDEO_LIVENESS_PASS_RATIO:
+        extra["decision_reason"] = "live_ratio_below_threshold"
+    else:
+        extra["decision_reason"] = "ok"
+
+    aggregated_face = {
+        "is_live": bool(decision),
+        "score": float(np.clip(avg_score, 0.0, 1.0)),
+        "threshold": float(np.clip(avg_threshold, 0.0, 1.0)),
+        "bbox": best_entry["face"].get("bbox", {}),
+        "extra": extra,
+    }
+
+    best_frame = best_entry["frame"].copy() if isinstance(best_entry.get("frame"), np.ndarray) else None
+    return [aggregated_face], best_frame
+
+
+def _process_video_liveness(
+    video_bytes: bytes,
+    filename: Optional[str],
+    detector_backend: str,
+    threshold: float,
+) -> Tuple[List[Dict], Optional[np.ndarray], int]:
+    if not video_bytes:
+        raise ValueError("Arquivo de vídeo vazio.")
+
+    t0 = time.time()
+    frames = decode_video_to_frames(
+        video_bytes,
+        filename=filename,
+        max_frames=VIDEO_LIVENESS_MAX_FRAMES,
+    )
+    if not frames:
+        raise ValueError("Não foi possível decodificar frames do vídeo.")
+
+    frame_entries: List[Dict] = []
+    total_inner_latency = 0
+    for idx, frame in enumerate(frames):
+        faces, latency = check_liveness(
+            frame,
+            detector_backend=detector_backend,
+            threshold=threshold,
+        )
+        total_inner_latency += latency
+        primary = _pick_primary_face(faces)
+        if primary:
+            frame_entries.append({
+                "frame_index": idx,
+                "face": primary,
+                "frame": frame,
+            })
+
+    aggregated_faces, best_frame = _aggregate_video_entries(frame_entries, len(frames), detector_backend)
+    latency_ms = int((time.time() - t0) * 1000)
+
+    frames_with_face = len(frame_entries)
+    decision = aggregated_faces[0]["is_live"] if aggregated_faces else None
+    log.info(
+        "[video-liveness] frames_total=%s frames_with_face=%s decision=%s latency_ms=%s",
+        len(frames), frames_with_face, decision, latency_ms,
+    )
+
+    if aggregated_faces:
+        extra = aggregated_faces[0].setdefault("extra", {})
+        extra["latency_total_ms"] = latency_ms
+        extra["latency_inner_ms"] = total_inner_latency
+
+    return aggregated_faces, best_frame, latency_ms
 
 # --------------- startup (opcional) ---------------
 @app.on_event("startup")
@@ -153,6 +292,7 @@ def health():
 @app.post("/v1/liveness", response_model=LivenessResponse)
 async def v1_liveness(
     image: Optional[UploadFile] = File(default=None),
+    video: Optional[UploadFile] = File(default=None),
     # query
     detector_backend_q: Optional[str] = Query(None),
     threshold_q: Optional[float] = Query(None),
@@ -163,33 +303,67 @@ async def v1_liveness(
     body: Optional[LivenessQuery] = None,
 ):
     try:
-        if image and body:
-            raise HTTPException(status_code=400, detail="Envie apenas multipart OU JSON, não ambos.")
-        if (image is None) and (not body):
-            raise HTTPException(status_code=400, detail="Envie 'image' (multipart) OU 'image_base64' no JSON.")
+        provided = [bool(image), bool(video), bool(body)]
+        if sum(1 for flag in provided if flag) > 1:
+            raise HTTPException(status_code=400, detail="Envie apenas uma fonte: video, image OU JSON.")
+        if not any(provided):
+            raise HTTPException(status_code=400, detail="Envie 'video' (multipart), 'image' ou 'image_base64'.")
 
-        bgr = read_image_from_upload(image.file) if image else read_image_from_base64(body.image_base64)
-        detector_backend, threshold = _resolve_params(detector_backend_q, threshold_q, detector_backend_f, threshold_f, body)
-
+        detector_backend, threshold = _resolve_params(
+            detector_backend_q, threshold_q, detector_backend_f, threshold_f, body,
+        )
         log.info(f"[liveness] backend={detector_backend} thr={threshold}")
-        results, latency_ms = check_liveness(bgr_image=bgr, detector_backend=detector_backend, threshold=threshold)
-        log.info(f"[liveness] faces={len(results)} latency_ms={latency_ms}")
-        if results:
-            f0 = results[0]; bb = f0['bbox']
-            log.info(f"[liveness] f0 is_live={f0['is_live']} score={f0['score']:.3f} bbox={bb['w']}x{bb['h']}@{bb['x']},{bb['y']}")
 
-        faces = [FaceResult(
-            is_live=r["is_live"],
-            score=r["score"],
-            threshold=r["threshold"],
-            bbox=BBox(**r["bbox"]),
-            extra={**(r.get("extra") or {}), "detector_used": detector_backend},
-        ) for r in results]
+        if video:
+            video_bytes = await video.read()
+            results, _best_frame, latency_ms = _process_video_liveness(
+                video_bytes,
+                filename=video.filename,
+                detector_backend=detector_backend,
+                threshold=threshold,
+            )
+            if results:
+                extra = results[0].get("extra", {})
+                live_ratio = extra.get("live_ratio")
+                live_ratio_str = f"{live_ratio:.3f}" if isinstance(live_ratio, (int, float)) else str(live_ratio)
+                log.info(
+                    "[liveness] video_summary frames_with_face=%s live_ratio=%s decision=%s",
+                    extra.get("frames_with_face"), live_ratio_str, results[0].get("is_live"),
+                )
+        else:
+            source = read_image_from_upload(image.file) if image else read_image_from_base64(body.image_base64)
+            results, latency_ms = check_liveness(
+                bgr_image=source,
+                detector_backend=detector_backend,
+                threshold=threshold,
+            )
+            log.info(f"[liveness] faces={len(results)} latency_ms={latency_ms}")
+            if results:
+                f0 = results[0]
+                bb = f0['bbox']
+                log.info(
+                    "[liveness] f0 is_live=%s score=%.3f bbox=%sx%s@%s,%s",
+                    f0['is_live'], f0['score'], bb['w'], bb['h'], bb['x'], bb['y'],
+                )
+
+        faces = [
+            FaceResult(
+                is_live=r["is_live"],
+                score=r["score"],
+                threshold=r["threshold"],
+                bbox=BBox(**r["bbox"]),
+                extra=_prepare_face_extra(r.get("extra"), detector_backend),
+            )
+            for r in results
+        ]
 
         return LivenessResponse(faces=faces, latency_ms=latency_ms)
 
     except HTTPException:
         raise
+    except ValueError as ve:
+        log.warning(f"[liveness] requisição inválida: {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         log.exception(f"[liveness] error: {e}")
         raise HTTPException(status_code=500, detail=f"Erro no processamento: {e}")
@@ -198,6 +372,7 @@ async def v1_liveness(
 @app.post("/v1/register", response_model=RegisterResponse)
 async def v1_register(
     image: Optional[UploadFile] = File(default=None),
+    video: Optional[UploadFile] = File(default=None),
     user_id: str = Query(..., description="ID único do usuário"),
     # query
     detector_backend_q: Optional[str] = Query(None),
@@ -209,30 +384,66 @@ async def v1_register(
     body: Optional[LivenessQuery] = None,
 ):
     try:
-        if image and body:
-            raise HTTPException(status_code=400, detail="Envie apenas multipart OU JSON.")
-        if (image is None) and (not body):
-            raise HTTPException(status_code=400, detail="Envie 'image' ou 'image_base64'.")
+        provided = [bool(image), bool(video), bool(body)]
+        if sum(1 for flag in provided if flag) > 1:
+            raise HTTPException(status_code=400, detail="Envie apenas uma fonte: video, image OU JSON.")
+        if not any(provided):
+            raise HTTPException(status_code=400, detail="Envie 'video', 'image' ou 'image_base64'.")
 
-        bgr = read_image_from_upload(image.file) if image else read_image_from_base64(body.image_base64)
-        detector_backend, threshold = _resolve_params(detector_backend_q, threshold_q, detector_backend_f, threshold_f, body)
-        log.info(f"[register] user={user_id} backend={detector_backend} thr={threshold}")
+        detector_backend, threshold = _resolve_params(
+            detector_backend_q, threshold_q, detector_backend_f, threshold_f, body,
+        )
+        log.info(
+            "[register] user=%s backend=%s thr=%s video=%s",
+            user_id, detector_backend, threshold, bool(video),
+        )
 
-        # 1) Liveness
-        faces, _ = check_liveness(bgr, detector_backend=detector_backend, threshold=threshold)
-        log.info(f"[register] faces={len(faces)}")
+        source_img: Optional[np.ndarray] = None
+        faces: List[Dict]
+        latency_ms = 0
+
+        if video:
+            video_bytes = await video.read()
+            faces, best_frame, latency_ms = _process_video_liveness(
+                video_bytes,
+                filename=video.filename,
+                detector_backend=detector_backend,
+                threshold=threshold,
+            )
+            source_img = best_frame
+            if faces:
+                extra = faces[0].get("extra", {})
+                live_ratio = extra.get("live_ratio")
+                live_ratio_str = f"{live_ratio:.3f}" if isinstance(live_ratio, (int, float)) else str(live_ratio)
+                log.info(
+                    "[register] video_summary frames_with_face=%s live_ratio=%s decision=%s latency_ms=%s",
+                    extra.get("frames_with_face"), live_ratio_str, faces[0].get("is_live"), latency_ms,
+                )
+        else:
+            source_img = read_image_from_upload(image.file) if image else read_image_from_base64(body.image_base64)
+            faces, latency_ms = check_liveness(
+                source_img,
+                detector_backend=detector_backend,
+                threshold=threshold,
+            )
+            log.info(f"[register] faces={len(faces)} latency_ms={latency_ms}")
+
         primary = _pick_primary_face(faces)
         if not primary:
-            msg = "Nenhum rosto válido"
+            msg = "Nenhum rosto válido no vídeo" if video else "Nenhum rosto válido"
             log.warning(f"[register] {msg}")
             return RegisterResponse(success=False, user_id=user_id, liveness_ok=False, message=msg)
         if not primary["is_live"]:
-            msg = "Anti-spoofing reprovado"
+            msg = "Anti-spoofing reprovado (vídeo)" if video else "Anti-spoofing reprovado"
+            log.warning(f"[register] {msg}")
+            return RegisterResponse(success=False, user_id=user_id, liveness_ok=False, message=msg)
+        if source_img is None:
+            msg = "Falha ao extrair frame do vídeo"
             log.warning(f"[register] {msg}")
             return RegisterResponse(success=False, user_id=user_id, liveness_ok=False, message=msg)
 
         # 2) Embedding
-        crop = _crop_by_bbox(bgr, primary["bbox"], margin=0.2)
+        crop = _crop_by_bbox(source_img, primary["bbox"], margin=0.2)
         init_recognition(providers=["CPUExecutionProvider"])
         emb = embed_face(crop)
 
@@ -242,6 +453,9 @@ async def v1_register(
 
     except HTTPException:
         raise
+    except ValueError as ve:
+        log.warning(f"[register] requisição inválida: {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         log.exception(f"[register] error: {e}")
         if os.getenv("RETURN_200_ON_ERRORS", "1") == "1":
@@ -252,6 +466,7 @@ async def v1_register(
 @app.post("/v1/verify", response_model=VerifyResponse)
 async def v1_verify(
     image: Optional[UploadFile] = File(default=None),
+    video: Optional[UploadFile] = File(default=None),
     user_id: str = Query(..., description="ID do usuário a verificar"),
     # query
     detector_backend_q: Optional[str] = Query(None),
@@ -265,35 +480,69 @@ async def v1_verify(
     body: Optional[LivenessQuery] = None,
 ):
     try:
-        if image and body:
-            raise HTTPException(status_code=400, detail="Envie apenas multipart OU JSON.")
-        if (image is None) and (not body):
-            raise HTTPException(status_code=400, detail="Envie 'image' ou 'image_base64'.")
+        provided = [bool(image), bool(video), bool(body)]
+        if sum(1 for flag in provided if flag) > 1:
+            raise HTTPException(status_code=400, detail="Envie apenas uma fonte: video, image OU JSON.")
+        if not any(provided):
+            raise HTTPException(status_code=400, detail="Envie 'video', 'image' ou 'image_base64'.")
 
-        bgr = read_image_from_upload(image.file) if image else read_image_from_base64(body.image_base64)
         detector_backend, threshold = _resolve_params(detector_backend_q, threshold_q, detector_backend_f, threshold_f, body)
         match_threshold = float(match_threshold_q if match_threshold_q is not None else (match_threshold_f if match_threshold_f is not None else 0.35))
-        log.info(f"[verify] user={user_id} backend={detector_backend} thr={threshold} match_thr={match_threshold}")
+        log.info(
+            "[verify] user=%s backend=%s thr=%s match_thr=%s video=%s",
+            user_id, detector_backend, threshold, match_threshold, bool(video),
+        )
 
-        # 1) Liveness
-        faces, _ = check_liveness(bgr, detector_backend=detector_backend, threshold=threshold)
-        log.info(f"[verify] faces={len(faces)}")
+        source_img: Optional[np.ndarray] = None
+        faces: List[Dict]
+        if video:
+            video_bytes = await video.read()
+            faces, best_frame, _latency = _process_video_liveness(
+                video_bytes,
+                filename=video.filename,
+                detector_backend=detector_backend,
+                threshold=threshold,
+            )
+            source_img = best_frame
+            if faces:
+                extra = faces[0].get("extra", {})
+                live_ratio = extra.get("live_ratio")
+                live_ratio_str = f"{live_ratio:.3f}" if isinstance(live_ratio, (int, float)) else str(live_ratio)
+                log.info(
+                    "[verify] video_summary frames_with_face=%s live_ratio=%s decision=%s",
+                    extra.get("frames_with_face"), live_ratio_str, faces[0].get("is_live"),
+                )
+        else:
+            source_img = read_image_from_upload(image.file) if image else read_image_from_base64(body.image_base64)
+            faces, _ = check_liveness(
+                source_img,
+                detector_backend=detector_backend,
+                threshold=threshold,
+            )
+            log.info(f"[verify] faces={len(faces)}")
+
         primary = _pick_primary_face(faces)
         if not primary:
-            msg = "Nenhum rosto válido"
+            msg = "Nenhum rosto válido no vídeo" if video else "Nenhum rosto válido"
             log.warning(f"[verify] {msg}")
             return VerifyResponse(success=False, user_id=user_id, liveness_ok=False, match=False,
                                   cosine_similarity=0.0, cosine_distance=1.0,
                                   match_threshold=match_threshold, message=msg)
         if not primary["is_live"]:
-            msg = "Anti-spoofing reprovado"
+            msg = "Anti-spoofing reprovado (vídeo)" if video else "Anti-spoofing reprovado"
+            log.warning(f"[verify] {msg}")
+            return VerifyResponse(success=False, user_id=user_id, liveness_ok=False, match=False,
+                                  cosine_similarity=0.0, cosine_distance=1.0,
+                                  match_threshold=match_threshold, message=msg)
+        if source_img is None:
+            msg = "Falha ao extrair frame do vídeo"
             log.warning(f"[verify] {msg}")
             return VerifyResponse(success=False, user_id=user_id, liveness_ok=False, match=False,
                                   cosine_similarity=0.0, cosine_distance=1.0,
                                   match_threshold=match_threshold, message=msg)
 
         # 2) Embedding atual
-        crop = _crop_by_bbox(bgr, primary["bbox"], margin=0.2)
+        crop = _crop_by_bbox(source_img, primary["bbox"], margin=0.2)
         init_recognition(providers=["CPUExecutionProvider"])
         emb_now = embed_face(crop)
 
@@ -312,11 +561,14 @@ async def v1_verify(
         return VerifyResponse(
             success=True, user_id=user_id, liveness_ok=True, match=match,
             cosine_similarity=sim, cosine_distance=dist, match_threshold=match_threshold,
-            message="OK" if match else "Não corresponde"
+            message="OK" if match else "Não corresponde",
         )
 
     except HTTPException:
         raise
+    except ValueError as ve:
+        log.warning(f"[verify] requisição inválida: {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         log.exception(f"[verify] error: {e}")
         if os.getenv("RETURN_200_ON_ERRORS", "1") == "1":
@@ -410,7 +662,7 @@ async def dataset_upload(
             score=float(primary["score"]),
             threshold=float(primary["threshold"]),
             bbox=BBox(**bbox),
-            extra={**(primary.get("extra") or {}), "detector_used": detector_backend},
+            extra=_prepare_face_extra(primary.get("extra"), detector_backend),
         )
 
         return DatasetUploadResponse(

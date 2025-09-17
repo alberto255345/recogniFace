@@ -64,84 +64,202 @@ def _mean_brightness(bgr: np.ndarray) -> float:
     y = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV)[..., 0]
     return float(np.mean(y))
 
-# -------- Detector OpenCV DNN (cache) --------
-PROTOTXT = "deploy.prototxt"
-WEIGHTS  = "res10_300x300_ssd_iter_140000_fp16.caffemodel"
-PROTOTXT_URLS = [
-    "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
-    "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy_lowres.prototxt",
-]
-CAFFEMODEL_URLS = [
-    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_models_201907/opencv_face_detector.caffemodel",
-    "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/res10_300x300_ssd_iter_140000_fp16.caffemodel",
-]
-_DNN_NET = None
-_DNN_READY = False
+_OPENCV_FACE_DIR = os.environ.get("OPENCV_FACE_DIR")
+if not _OPENCV_FACE_DIR:
+    model_dir = os.environ.get("MODEL_DIR")
+    if model_dir:
+        _OPENCV_FACE_DIR = os.path.join(model_dir, "opencv_face")
+    else:
+        _OPENCV_FACE_DIR = "models/opencv_face"
+_OPENCV_FACE_DIR = os.path.expanduser(_OPENCV_FACE_DIR)
+_OPENCV_DNN_DISABLE = os.environ.get("OPENCV_DNN_DISABLE", "0").lower() in {"1", "true", "yes"}
+_OPENCV_DNN_CHECKED = False
+_OPENCV_DNN_OK = False
+_OPENCV_DNN_NET = None
+_YUNET_CHECKED = False
+_YUNET_AVAILABLE = False
+_YUNET_DETECTOR = None
+_last_log_ts = 0.0
 
-def _model_dir() -> str:
-    root = os.environ.get("MODEL_DIR", "/workspace/models")
-    path = os.path.join(root, "opencv_face")
-    os.makedirs(path, exist_ok=True)
-    return path
+YUNET_SCORE_THRESHOLD = float(os.environ.get("YUNET_SCORE_THRESHOLD", "0.6"))
+YUNET_NMS_THRESHOLD = float(os.environ.get("YUNET_NMS_THRESHOLD", "0.3"))
 
-def _download(url: str, dst: str) -> None:
-    import urllib.request
-    log.info(f"[liveness-dnn] download {url} -> {dst}")
-    urllib.request.urlretrieve(url, dst)
 
-def _get_dnn_paths() -> Tuple[str, str]:
-    p = _model_dir()
-    proto = os.path.join(p, PROTOTXT)
-    weights = os.path.join(p, WEIGHTS)
-    if not os.path.exists(proto):
-        ok = False
-        for u in PROTOTXT_URLS:
-            try: _download(u, proto); ok = True; break
-            except Exception as e: log.warning(f"[dnn] prototxt fail {u}: {e}")
-        if not ok: raise RuntimeError("Falha ao obter prototxt do detector.")
-    if not os.path.exists(weights):
-        ok = False
-        for u in CAFFEMODEL_URLS:
-            try: _download(u, weights); ok = True; break
-            except Exception as e: log.warning(f"[dnn] caffemodel fail {u}: {e}")
-        if not ok: raise RuntimeError("Falha ao obter caffemodel do detector.")
-    return proto, weights
+def _log_throttle(prefix: str, msg: str, every_sec: int = 30) -> None:
+    global _last_log_ts
+    now = time.time()
+    if now - _last_log_ts >= every_sec:
+        log.info(f"{prefix} {msg}")
+        _last_log_ts = now
 
-def _ensure_dnn_loaded():
-    global _DNN_NET, _DNN_READY
-    if _DNN_READY and _DNN_NET is not None:
-        return
-    proto, weights = _get_dnn_paths()
-    _DNN_NET = cv2.dnn.readNetFromCaffe(proto, weights)
-    _DNN_READY = True
 
-def _detect_faces_dnn(bgr: np.ndarray, conf_thr: float = 0.5) -> List[Dict]:
-    _ensure_dnn_loaded()
+def _dnn_files() -> Tuple[str, str]:
+    prototxt = os.path.join(_OPENCV_FACE_DIR, "deploy.prototxt")
+    caffemodel = os.path.join(_OPENCV_FACE_DIR, "res10_300x300_ssd_iter_140000_fp16.caffemodel")
+    return prototxt, caffemodel
+
+
+def _check_dnn_available_once() -> bool:
+    global _OPENCV_DNN_CHECKED, _OPENCV_DNN_OK
+    if _OPENCV_DNN_CHECKED:
+        return _OPENCV_DNN_OK
+    if _OPENCV_DNN_DISABLE:
+        _OPENCV_DNN_OK = False
+    else:
+        prototxt, caffemodel = _dnn_files()
+        _OPENCV_DNN_OK = os.path.isfile(prototxt) and os.path.isfile(caffemodel)
+        if not _OPENCV_DNN_OK:
+            _log_throttle("[liveness-core]", "DNN Caffe indisponível localmente; usando Haar/YuNet.")
+    _OPENCV_DNN_CHECKED = True
+    return _OPENCV_DNN_OK
+
+
+def _load_dnn_net():
+    global _OPENCV_DNN_NET, _OPENCV_DNN_OK
+    if _OPENCV_DNN_NET is not None:
+        return _OPENCV_DNN_NET
+    if not _check_dnn_available_once():
+        return None
+    prototxt, caffemodel = _dnn_files()
+    try:
+        _OPENCV_DNN_NET = cv2.dnn.readNetFromCaffe(prototxt, caffemodel)
+        return _OPENCV_DNN_NET
+    except Exception as exc:
+        log.warning(f"[liveness-dnn] erro ao carregar rede Caffe local: {exc}")
+        _OPENCV_DNN_NET = None
+        _OPENCV_DNN_OK = False
+        return None
+
+
+def _detect_faces_opencv_dnn(bgr: np.ndarray, conf_thr: float = 0.5) -> Tuple[List[Dict], str]:
+    net = _load_dnn_net()
+    if net is None:
+        return [], "opencv-dnn-missing"
+
     H, W = bgr.shape[:2]
-    blob = cv2.dnn.blobFromImage(cv2.resize(bgr, (300, 300)),
-                                 1.0, (300, 300),
-                                 mean=(104.0,177.0,123.0), swapRB=False, crop=False)
-    _DNN_NET.setInput(blob)
-    detections = _DNN_NET.forward()
-    out = []
+    try:
+        blob = cv2.dnn.blobFromImage(bgr, 1.0, (300, 300), (104.0, 177.0, 123.0), False, False)
+        net.setInput(blob)
+        detections = net.forward()
+    except Exception as exc:
+        log.warning(f"[liveness-dnn] erro ao rodar DNN: {exc}")
+        # evita novas tentativas neste processo
+        global _OPENCV_DNN_CHECKED, _OPENCV_DNN_OK, _OPENCV_DNN_NET
+        _OPENCV_DNN_NET = None
+        _OPENCV_DNN_CHECKED = True
+        _OPENCV_DNN_OK = False
+        return [], "opencv-dnn-error"
+
+    faces: List[Dict] = []
     if detections.ndim == 4:
         for i in range(detections.shape[2]):
             conf = float(detections[0, 0, i, 2])
-            if conf < conf_thr: continue
-            box = detections[0, 0, i, 3:7] * np.array([W, H, W, H], dtype=np.float32)
-            x1, y1, x2, y2 = box.astype(int)
-            x, y = max(0, x1), max(0, y1)
-            w, h = max(0, x2 - x1), max(0, y2 - y1)
-            if w >= 30 and h >= 30:
-                out.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h)})
-    return out
+            if conf < conf_thr:
+                continue
+            x1, y1, x2, y2 = (detections[0, 0, i, 3:7] * [W, H, W, H]).astype(int)
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            w, h = max(0, int(x2) - x1), max(0, int(y2) - y1)
+            if w > 0 and h > 0:
+                faces.append({"x": x1, "y": y1, "w": w, "h": h})
+    return faces, "opencv-dnn"
 
-def _detect_faces_haar(bgr: np.ndarray) -> List[Dict]:
+
+def _detect_faces_haar(bgr: np.ndarray) -> Tuple[List[Dict], str]:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                     minSize=(80,80), flags=cv2.CASCADE_SCALE_IMAGE)
-    return [{"x":int(x), "y":int(y), "w":int(w), "h":int(h)} for (x,y,w,h) in faces]
+    rects = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(64, 64),
+        flags=cv2.CASCADE_SCALE_IMAGE,
+    )
+    faces = [{"x": int(x), "y": int(y), "w": int(w), "h": int(h)} for (x, y, w, h) in rects]
+    return faces, "haar"
+
+
+def _yunet_model_path() -> str:
+    return os.path.join(_OPENCV_FACE_DIR, "face_detection_yunet_2023mar.onnx")
+
+
+def _ensure_yunet_loaded():
+    global _YUNET_CHECKED, _YUNET_AVAILABLE, _YUNET_DETECTOR
+    if _YUNET_CHECKED and not _YUNET_AVAILABLE:
+        return None
+    if not hasattr(cv2, "FaceDetectorYN_create"):
+        if not _YUNET_CHECKED:
+            _log_throttle("[liveness-yunet]", "OpenCV não possui FaceDetectorYN_create; instale opencv-contrib-python.")
+        _YUNET_CHECKED = True
+        _YUNET_AVAILABLE = False
+        _YUNET_DETECTOR = None
+        return None
+    model_path = _yunet_model_path()
+    if not os.path.isfile(model_path):
+        if not _YUNET_CHECKED:
+            _log_throttle("[liveness-yunet]", f"Modelo YuNet não encontrado em {model_path}")
+        _YUNET_CHECKED = True
+        _YUNET_AVAILABLE = False
+        _YUNET_DETECTOR = None
+        return None
+    if _YUNET_DETECTOR is None:
+        try:
+            _YUNET_DETECTOR = cv2.FaceDetectorYN_create(
+                model=model_path,
+                config="",
+                input_size=(320, 320),
+                score_threshold=YUNET_SCORE_THRESHOLD,
+                nms_threshold=YUNET_NMS_THRESHOLD,
+                top_k=500,
+            )
+            _YUNET_AVAILABLE = True
+        except Exception as exc:
+            _log_throttle("[liveness-yunet]", f"Falha ao carregar YuNet: {exc}")
+            _YUNET_CHECKED = True
+            _YUNET_AVAILABLE = False
+            _YUNET_DETECTOR = None
+            return None
+    _YUNET_CHECKED = True
+    return _YUNET_DETECTOR
+
+
+def _detect_faces_yunet(bgr: np.ndarray) -> Tuple[List[Dict], str]:
+    detector = _ensure_yunet_loaded()
+    if detector is None:
+        return [], "yunet-missing"
+    h, w = bgr.shape[:2]
+    try:
+        detector.setInputSize((w, h))
+        _, results = detector.detect(bgr)
+    except Exception as exc:
+        _log_throttle("[liveness-yunet]", f"Erro durante detecção YuNet: {exc}")
+        return [], "yunet-error"
+    faces: List[Dict] = []
+    if results is not None:
+        for row in results:
+            x, y, ww, hh = map(int, row[:4])
+            faces.append({"x": max(0, x), "y": max(0, y), "w": max(0, ww), "h": max(0, hh)})
+    return faces, "yunet"
+
+
+def detect_faces(bgr: np.ndarray, backend: str) -> Tuple[List[Dict], str]:
+    backend = (backend or DEFAULT_DETECTOR).lower()
+    if backend not in {"haar", "opencv", "yunet"}:
+        backend = DEFAULT_DETECTOR
+    if backend == "yunet":
+        faces, used = _detect_faces_yunet(bgr)
+        if used == "yunet":
+            return faces, used
+        faces, used = _detect_faces_opencv_dnn(bgr)
+        if used == "opencv-dnn":
+            return faces, used
+        return _detect_faces_haar(bgr)
+    if backend == "haar":
+        return _detect_faces_haar(bgr)
+    # padrão/opencv: tenta DNN e cai para Haar uma única vez
+    faces, used = _detect_faces_opencv_dnn(bgr)
+    if used == "opencv-dnn":
+        return faces, used
+    return _detect_faces_haar(bgr)
 
 # -------- Métricas tradicionais --------
 def _laplacian_blur_score(gray_roi: np.ndarray) -> float:
@@ -291,21 +409,12 @@ def check_liveness(
 
     results: List[Dict] = []
     # 1) detectar
-    try:
-        faces = _detect_faces_dnn(img, conf_thr=0.5)
-        log.info(f"[liveness-core] faces_dnn={len(faces)}")
-        if not faces:
-            faces = _detect_faces_haar(img)
-            log.info(f"[liveness-core] faces_haar={len(faces)}")
-    except Exception as e:
-        log.warning(f"[liveness-core] DNN erro: {e}; fallback Haar")
-        try:
-            faces = _detect_faces_haar(img)
-            log.info(f"[liveness-core] faces_haar={len(faces)}")
-        except Exception as e2:
-            latency = _now_ms() - t0
-            log.exception(f"[liveness-core] sem detecção após {latency} ms: {e2}")
-            return [], latency
+    backend_norm = (detector_backend or DEFAULT_DETECTOR).lower()
+    faces, detector_used = detect_faces(img, backend_norm)
+    log.info(
+        "[liveness-core] faces=%s detector_used=%s requested=%s",
+        len(faces), detector_used, backend_norm,
+    )
 
     # 2) métricas + limiar dinâmico (agora com aumento se “suspeito”)
     for i, bb in enumerate(faces):
@@ -335,7 +444,12 @@ def check_liveness(
             "score": sc,
             "threshold": dyn_thr,
             "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
-            "extra": {"detector_backend": "opencv-dnn", "explain": detail}
+            "extra": {
+                "detector_backend": detector_used,
+                "detector_used": detector_used,
+                "detector_requested": backend_norm,
+                "explain": detail,
+            }
         })
         log.info(f"[liveness-core] face#{i} score={sc:.3f} live={live} thr_eff={dyn_thr:.3f} "
                  f"axis={detail['axis_anisotropy']:.2f} glare={detail['glare']:.2f} lines={detail['line_ratio']:.2f}")

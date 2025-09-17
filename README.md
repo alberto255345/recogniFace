@@ -6,7 +6,7 @@ API leve em **FastAPI** para **liveness (anti-spoofing)** e **reconhecimento fac
 
 ## ✨ Recursos
 
-* **/v1/liveness**: heurísticas + sinais anti-spoof (blur, alta-freq, anisotropia de grade, glare/reflexo, linhas retas, etc.) com **limiar dinâmico**.
+* **/v1/liveness**: heurísticas + sinais anti-spoof (blur, alta-freq, anisotropia de grade, glare/reflexo, linhas retas, etc.) com **limiar dinâmico**, agora aceitando **imagem única ou clipe curto de vídeo**.
 * **/v1/register**: liveness ➜ embedding (InsightFace) ➜ salva em `data/embeddings/{user_id}.npz`.
 * **/v1/verify**: liveness ➜ embedding ➜ compara com cadastro (cosseno), com `match_threshold`.
 * **/v1/dataset/upload**: salva imagens rotuladas (`live`/`spoof`) e crops de face para treino.
@@ -99,6 +99,11 @@ export LIVENESS_W_SHARP_SMALL=0.12
 export LIVENESS_AXIS_SUSPECT=0.35
 export LIVENESS_GLARE_SUSPECT=0.08
 export LIVENESS_LINES_SUSPECT=0.10
+
+# Liveness via vídeo (amostragem e votação)
+export VIDEO_LIVENESS_MAX_FRAMES=24
+export VIDEO_LIVENESS_MIN_FRAMES=8
+export VIDEO_LIVENESS_PASS_RATIO=0.6
 ```
 
 > **INSIGHTFACE\_HOME** evita re-download do `buffalo_l` a cada startup.
@@ -141,13 +146,17 @@ Retorna status, versão, Python e info básica de CUDA (sempre false no modo CPU
 
 ### `POST /v1/liveness`
 
-**Multipart** (`image`) ou **JSON** (`image_base64`). Parâmetros opcionais:
+**Multipart** (`video` para clipes curtos ou `image` para fotos) ou **JSON** (`image_base64`). Parâmetros opcionais:
 
 * `detector_backend` (padrão `opencv`)
 * `threshold` (padrão `0.5` — pode ser dinamicamente ajustado)
 
 ```bash
-# Multipart
+# Multipart (vídeo)
+curl -s -X POST "$BASE/v1/liveness?detector_backend=opencv&threshold=0.5" \
+  -F "video=@/tmp/clip.webm;type=video/webm" | jq
+
+# Multipart (fallback em foto)
 curl -s -X POST "$BASE/v1/liveness?detector_backend=opencv&threshold=0.5" \
   -F "image=@$HOME/foto.png;type=image/png" | jq
 ```
@@ -180,23 +189,23 @@ curl -s -X POST "$BASE/v1/liveness?detector_backend=opencv&threshold=0.5" \
 }
 ```
 
-> O **threshold mostrado é o efetivo**, após ajustes dinâmicos (ex.: sobe se detectar sinais de spoof; desce levemente em ambientes difíceis).
+> O **threshold mostrado é o efetivo**, após ajustes dinâmicos (ex.: sobe se detectar sinais de spoof; desce levemente em ambientes difíceis). Para vídeo, o retorno agrega múltiplos frames (ratio de “live” vs. “spoof”) e inclui estatísticas em `extra.per_frame`.
 
 ---
 
 ### `POST /v1/register`
 
-Executa **liveness** e, se aprovado, extrai embedding (InsightFace) e salva em `data/embeddings/{user_id}.npz`.
+Executa **liveness** (aceitando vídeo curto ou foto) e, se aprovado, extrai embedding (InsightFace) da melhor frame para salvar em `data/embeddings/{user_id}.npz`.
 
-Parâmetros (query/form):
+Parâmetros (query/form + multipart):
 
 * `user_id` (obrigatório)
 * `detector_backend` (opcional)
 * `threshold` (opcional)
 
 ```bash
-curl -i --max-time 30 \
-  -F "image=@$HOME/imagem.jpeg;type=image/jpeg" \
+curl -i --max-time 60 \
+  -F "video=@/tmp/clip.webm;type=video/webm" \
   "$BASE/v1/register?user_id=15&detector_backend=opencv&threshold=0.5"
 ```
 
@@ -210,17 +219,17 @@ curl -i --max-time 30 \
 
 ### `POST /v1/verify`
 
-Executa **liveness** ➜ embedding ➜ compara c/ cadastro de `user_id`.
+Executa **liveness** (clipe de vídeo recomendado) ➜ embedding ➜ compara c/ cadastro de `user_id`.
 
-Parâmetros (query/form):
+Parâmetros (query/form + multipart):
 
 * `user_id` (obrigatório)
 * `detector_backend`, `threshold` (opcionais)
 * `match_threshold` (padrão **0.35**, distância cosseno; menor = mais estrito)
 
 ```bash
-curl -i --max-time 30 \
-  -F "image=@$HOME/foto.png;type=image/png" \
+curl -i --max-time 60 \
+  -F "video=@/tmp/clip.webm;type=video/webm" \
   "$BASE/v1/verify?user_id=15&detector_backend=opencv&threshold=0.40&match_threshold=0.35"
 ```
 
